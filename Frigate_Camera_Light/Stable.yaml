@@ -2,57 +2,11 @@
 blueprint:
   name: Frigate Camera Light (1.0.0)
   description: |
-    Control a dimmable light using Frigate person reviews, zone occupancy,
-    sun elevation, and optional motion sensors. No helper entities are required.
+    Keep a dimmable light on while people occupy selected Frigate zones,
+    with optional motion sensors and a sun elevation condition.
 
-    SETUP
-    Requires Home Assistant 2024.11 or later, MQTT, the Frigate integration,
-    and a light entity supporting on/off and brightness control. Select a camera,
-    a light, and at least one exact Frigate zone ID. Camera mapping uses the
-    camera_name attribute of the selected Frigate camera entity.
-    Import the public blueprint URL or save the file under
-    /config/blueprints/automation/local/Stable.yaml and reload blueprints.
-
-    BEHAVIOR
-    detection is selected by default; optionally add alert. A new/update review
-    must match the camera, selected severity, a required zone, and person.
-    A matching review starts a presence session. MQTT person counts keep the
-    light on while a selected zone is occupied, including stationary people
-    and after the review ends. When all zones report zero and optional motion
-    sensors are inactive, the cooldown starts. Default: 15 seconds.
-    A renewed occupancy request cancels pending switch-off. Motion sensors can
-    also start a request independently of Frigate reviews. All requests require
-    sun elevation at or below the selected threshold, default -3 degrees.
-
-    Count topics: <prefix>/<zone_id>/person, default prefix frigate.
-    Use zone IDs unique to this camera. Identically named zones on other cameras
-    can have combined counts. All selected zones must publish counts before
-    they can be considered clear. Missing counts are unknown, not zero. Debug
-    reports missing counts. Start with one zone when setting up the automation.
-    Review zones and objects are aggregated; they do not guarantee that a
-    particular person occupied a particular zone. Occupancy is zone-based,
-    not tied to an individually tracked person. An accepted session continues
-    if its review is upgraded from detection to alert.
-
-    MAXIMUM ON-TIME
-    Default: 5 minutes, including cooldown. The light switches off and is
-    locked out while the request remains active. Review updates cannot bypass
-    the lockout. Once zones report zero and motion sensors clear, a later
-    request can activate the light again. A stuck positive or missing count
-    can therefore block the next activation instead of leaving the light on.
-
-    RESTARTS AND LIMITS
-    Runtime state does not survive a Home Assistant restart, automation reload,
-    or a stopped/failed run. Each new controller run first requests light OFF
-    and starts with empty counts and no session. It needs fresh MQTT messages
-    and/or an active motion sensor to resume. Previous lockout is not restored.
-    Wait for zone counts after a restart; missed messages are not reconstructed.
-    MQTT events arriving while actions execute can be missed by wait_for_trigger.
-    Missing clear messages are bounded by the maximum on-time, then lockout.
-    Timing can vary by roughly five seconds, plus service execution delays.
-    The cutoff only works while Home Assistant runs and the light is reachable.
-    Disabling the automation stops control but does not switch the light off.
-    Switch it off manually first if required.
+    Requires MQTT with retained messages, the Frigate integration, and a dimmable
+    light.
   domain: automation
   homeassistant:
     min_version: 2024.11.0
@@ -170,8 +124,8 @@ blueprint:
       default: frigate
       selector:
         text: {}
-mode: single
-max_exceeded: silent
+mode: queued
+max_exceeded: warning
 trace:
   stored_traces: 20
 trigger_variables:
@@ -197,9 +151,8 @@ triggers:
   event_type: automation_reloaded
   id: reload
 - trigger: time_pattern
-  seconds: 0
-  id: watchdog
-  minutes: /1
+  seconds: /5
+  id: tick
 variables:
   review_topic: !input 'mqtt_topic'
   occupancy_topic_prefix: !input 'occupancy_prefix'
@@ -219,204 +172,232 @@ variables:
   zone_prefix: !input 'occupancy_prefix'
 actions:
 - variables:
-    controller_state: {}
-    last_light_command: '{{ as_timestamp(now()) | int }}'
-    last_filter: No review received
-    last_decision: ''
+    controller_key: '{{ ''automation_'' ~ (this.attributes.get(''id'',this.entity_id) | string) }}'
     message_source: '{{ trigger.id if trigger is defined and trigger.id is defined else ''manual'' }}'
     message_payload: '{{ trigger.payload if trigger is defined and trigger.id is defined and trigger.id in [''review'',''occupancy'']
       else '''' }}'
     message_topic: '{{ trigger.topic if trigger is defined and trigger.id is defined and trigger.id == ''occupancy'' else
       '''' }}'
-- condition: template
-  value_template: '{{ state_attr(camera_entity,''camera_name'') | default('''',true) | length > 0 and required_zones | length
-    > 0 and required_severities | length > 0 }}'
-- alias: Reset the selected light when the controller starts
-  action: light.turn_off
-  continue_on_error: true
-  target:
-    entity_id: '{{ lamp }}'
-- repeat:
-    while:
-    - condition: template
-      value_template: '{{ true }}'
-    sequence:
-    - variables:
-        source: '{{ message_source }}'
-        timestamp: '{{ as_timestamp(now()) | int }}'
-        camera_id: '{{ state_attr(camera_entity,''camera_name'') | default('''',true) }}'
-        packet: '{{ message_payload | from_json({}) if source == ''review'' else {} }}'
-        cached: '{{ controller_state }}'
-        previous_desired: '{{ controller_state.get(''w'',false) }}'
-        solar_raw: '{{ state_attr(solar_entity,''elevation'') if state_attr(solar_entity,''elevation'') is not none else states(solar_entity)
-          }}'
-    - variables:
-        after: '{{ packet.get(''after'',{}) if packet is mapping and packet.get(''after'',{}) is mapping else {} }}'
-        cache: '{{ cached if cached is mapping else {} }}'
-        solar_valid: '{{ states(solar_entity) not in [''unknown'',''unavailable''] and is_number(solar_raw) }}'
-    - variables:
-        config_valid: '{{ camera_id | length > 0 and required_zones | length > 0 and required_severities | length > 0 }}'
-        event_type: '{{ packet.get(''type'','''') if packet is mapping else '''' }}'
-        event_data: '{{ after.get(''data'',{}) if after.get(''data'',{}) is mapping else {} }}'
-        from_camera: '{{ source == ''review'' and after.get(''camera'','''') == camera_id and camera_id | length > 0 }}'
-        motion_active: '{{ motion_entities | select(''is_state'',''on'') | list | length > 0 }}'
-        dark: '{{ solar_valid and solar_raw | float(90) <= solar_limit | float }}'
-        config_matches: '{{ cache.get(''v'') == 2 and cache.get(''m'') == ''presence'' and cache.get(''c'') == camera_id and
-          cache.get(''z'',{}) is mapping and cache.get(''z'',{}) | list | sort == required_zones | sort }}'
-    - variables:
-        prior: '{{ cache if config_matches else {} }}'
-        event_zones: '{{ event_data.get(''zones'',[]) if event_data.get(''zones'',[]) is list else [] }}'
-        event_objects: '{{ event_data.get(''objects'',[]) if event_data.get(''objects'',[]) is list else [] }}'
-        zone_id: '{{ message_topic[(zone_prefix | length)+1:-7] if source == ''occupancy'' and message_topic.startswith(zone_prefix
-          ~ ''/'') and message_topic.endswith(''/person'') else '''' }}'
-        zone_count: '{{ message_payload | int(-1) if source == ''occupancy'' else -1 }}'
-    - variables:
-        zones_ok: '{{ required_zones | select(''in'',event_zones) | list | length > 0 }}'
-        objects_ok: '{{ required_labels | select(''in'',event_objects | map(''regex_replace'',''-verified$'','''') | list)
-          | list | length > 0 }}'
-        severity_ok: '{{ after.get(''severity'','''') in required_severities }}'
-        occupancy_usable: '{{ source == ''occupancy'' and zone_id in required_zones and zone_count | int >= 0 and is_number(message_payload)
-          and message_payload | float == zone_count | int }}'
-    - variables:
-        qualifies: |-
-          {{ from_camera and event_type in ['new','update'] and after.get('id','') is string
-             and after.get('id','') | length > 0 and after.get('end_time') is none
-             and zones_ok and objects_ok and severity_ok }}
-        counts: |-
-          {% set ns=namespace(z={}) %} {% for zone in required_zones %}
-            {% set val=prior.get('z',{}).get(zone,-1) | int(-1) %}
-            {% if occupancy_usable and zone_id == zone %}{% set val=zone_count | int %}{% endif %}
-            {% set ns.z=dict(ns.z,**{zone:val}) %}
-          {% endfor %} {{ ns.z }}
-    - variables:
-        zones_clear: '{{ counts | length > 0 and counts.values() | select(''equalto'',0) | list | length == counts | length
-          }}'
-        missing_zones: '{{ counts.values() | select(''lt'',0) | list | length }}'
-        occupied_zones: '{{ counts.values() | select(''gt'',0) | list | length }}'
-        pulse_until: '{{ timestamp + 30 if qualifies else prior.get(''p'',0) | int(0) }}'
-    - variables:
-        armed: '{% if qualifies %}{{ true }} {% else %}{{ prior.get(''a'',false) and (not zones_clear or pulse_until | int
-          > timestamp or previous_desired or prior.get(''l'',false)) }}{% endif %}'
-    - variables:
-        raw_demand: '{{ motion_active or (armed and not zones_clear) }}'
-    - variables:
-        off_at: '{% if raw_demand %}{{ 0 }} {% elif prior.get(''o'',0) | int > 0 %}{{ prior.get(''o'',0) | int }} {% elif
-          prior.get(''h'',false) %}{{ timestamp + delay_seconds | int }} {% else %}{{ 0 }}{% endif %}'
-        previous_lock: '{{ prior.get(''l'',false) }}'
-    - variables:
-        remaining: '{{ [0, off_at | int - timestamp] | max }}'
-        demand_with_delay: '{{ raw_demand or off_at | int > timestamp }}'
-    - variables:
-        run_start: |-
-          {% if config_valid and dark and demand_with_delay and not previous_lock %}
-            {{ prior.get('s',0) | int if prior.get('s',0) | int > 0 else timestamp }}
-          {% else %}{{ prior.get('s',0) | int if previous_lock else 0 }}{% endif %}
-    - variables:
-        limit_reached: '{{ run_start | int > 0 and timestamp - run_start | int >= maximum_minutes | float * 60 }}'
-    - variables:
-        locked: '{{ (previous_lock or limit_reached) and raw_demand }}'
-        limit_block: '{{ previous_lock or limit_reached }}'
-        next_state: '{{ {''v'':2,''m'':''presence'',''c'':camera_id,''z'':counts,''p'':pulse_until | int, ''a'':armed,''h'':raw_demand,''o'':off_at
-          | int,''s'':run_start | int if demand_with_delay else 0,''l'':locked} }}'
-    - variables:
-        wanted: '{{ config_valid and dark and demand_with_delay and not limit_block }}'
-        decision: |-
-          {% if not config_valid %}ERROR: Check camera and filters
-          {% elif limit_block %}MAX reached: OFF until request clears
-          {% elif not solar_valid %}ERROR: Sun elevation unavailable
-          {% elif not dark %}Daylight: light blocked
-          {% elif motion_active %}Motion sensor active
-          {% elif armed and occupied_zones | int > 0 %}Person occupancy active
-          {% elif armed and missing_zones | int > 0 %}Waiting for {{ missing_zones }} zone counts
-          {% elif remaining | int > 0 %}Cooldown {{ remaining }}s
-          {% else %}No light request{% endif %}
-        filter_result: |-
-          {% if source == 'occupancy' and occupancy_usable %}{{ zone_id }}: {{ zone_count }} people
-          {% elif source == 'occupancy' %}Unmatched or invalid count
-          {% elif source != 'review' %}{{ last_filter }}
-          {% elif not from_camera %}Other camera or invalid packet
-          {% elif event_type == 'end' %}Review ended
-          {% elif not severity_ok %}Severity not selected
-          {% elif not zones_ok %}No matching zone
-          {% elif not objects_ok %}No matching object type
-          {% elif qualifies %}Review accepted
-          {% else %}Review ignored{% endif %}
-    - variables:
-        state_changed: '{{ wanted != previous_desired }}'
-        status_text: '{{ (''ON '' ~ (brightness_pct | int) ~ ''%'' if wanted else ''OFF'') ~ '' | '' ~ decision | trim ~ ''
-          | Sun '' ~ ((solar_raw | float | round(1) | string) if solar_valid else ''?'') ~ '' | Filter: '' ~ filter_result
-          | trim }}'
-        command_needed: '{{ state_changed or (timestamp - last_light_command | int >= 30 and states(lamp) in [''on'',''off'']
-          and is_state(lamp,''on'') != wanted) }}'
-        report_needed: '{{ debug_enabled and (state_changed or locked != previous_lock or decision | trim != last_decision
-          or (source == ''review'' and from_camera) or (source == ''occupancy'' and occupancy_usable)) }}'
-    - if:
+- variables:
+    cache_topic: '{{ ''frigate_camera_light/'' ~ (controller_key | regex_replace(''[^a-zA-Z0-9_-]'',''_'')) ~ ''/state'' }}'
+- alias: Read the latest retained state for this queued run
+  wait_for_trigger:
+  - trigger: mqtt
+    topic: '{{ cache_topic }}'
+    qos: 1
+  timeout:
+    seconds: 2
+  continue_on_timeout: true
+- variables:
+    stored: '{{ wait.trigger.payload | from_json({}) if wait.completed and wait.trigger is not none else {} }}'
+- variables:
+    cache_valid: '{{ stored is mapping and stored.get(''schema'') == 1 and stored.get(''owner'') == controller_key and stored.get(''state'',{})
+      is mapping }}'
+    last_light_command: '{{ stored.get(''last_command'',0) | int(0) if cache_valid else 0 }}'
+    last_filter: '{{ stored.get(''last_filter'',''No review received'') if cache_valid else ''No review received'' }}'
+    last_decision: '{{ stored.get(''last_decision'','''') if cache_valid else '''' }}'
+- if:
+  - condition: template
+    value_template: '{{ not cache_valid and is_state(lamp,''on'') }}'
+  then:
+  - action: light.turn_off
+    continue_on_error: true
+    target:
+      entity_id: '{{ lamp }}'
+  - action: logbook.log
+    continue_on_error: true
+    data:
+      name: Frigate Camera Light
+      entity_id: '{{ lamp }}'
+      message: State unavailable or invalid on {{ cache_topic }}. Requested OFF; check retained MQTT state and broker permissions.
+  - stop: Controller state unavailable while light is on
+    error: true
+- if:
+  - condition: template
+    value_template: '{{ wait.completed and not cache_valid }}'
+  then:
+  - stop: Invalid retained controller state; check the internal state topic
+    error: true
+- variables:
+    source: '{{ message_source }}'
+    timestamp: '{{ as_timestamp(now()) | int }}'
+    camera_id: '{{ state_attr(camera_entity,''camera_name'') | default('''',true) }}'
+    packet: '{{ message_payload | from_json({}) if source == ''review'' else {} }}'
+    cached: '{{ stored.get(''state'',{}) if cache_valid and stored.get(''light'') == lamp else {} }}'
+    previous_desired: '{{ cached.get(''w'',false) if cached is mapping else false }}'
+    solar_raw: '{{ state_attr(solar_entity,''elevation'') if state_attr(solar_entity,''elevation'') is not none else states(solar_entity)
+      }}'
+- variables:
+    after: '{{ packet.get(''after'',{}) if packet is mapping and packet.get(''after'',{}) is mapping else {} }}'
+    cache: '{{ cached if cached is mapping else {} }}'
+    solar_valid: '{{ states(solar_entity) not in [''unknown'',''unavailable''] and is_number(solar_raw) }}'
+- variables:
+    config_valid: '{{ camera_id | length > 0 and required_zones | length > 0 and required_severities | length > 0 }}'
+    event_type: '{{ packet.get(''type'','''') if packet is mapping else '''' }}'
+    event_data: '{{ after.get(''data'',{}) if after.get(''data'',{}) is mapping else {} }}'
+    from_camera: '{{ source == ''review'' and after.get(''camera'','''') == camera_id and camera_id | length > 0 }}'
+    motion_active: '{{ motion_entities | select(''is_state'',''on'') | list | length > 0 }}'
+    dark: '{{ solar_valid and solar_raw | float(90) <= solar_limit | float }}'
+    config_matches: '{{ cache.get(''v'') == 2 and cache.get(''m'') == ''presence'' and cache.get(''c'') == camera_id and cache.get(''z'',{})
+      is mapping and cache.get(''z'',{}) | list | sort == required_zones | sort }}'
+- variables:
+    prior: '{{ cache if config_matches else {} }}'
+    event_zones: '{{ event_data.get(''zones'',[]) if event_data.get(''zones'',[]) is list else [] }}'
+    event_objects: '{{ event_data.get(''objects'',[]) if event_data.get(''objects'',[]) is list else [] }}'
+    zone_id: '{{ message_topic[(zone_prefix | length)+1:-7] if source == ''occupancy'' and message_topic.startswith(zone_prefix
+      ~ ''/'') and message_topic.endswith(''/person'') else '''' }}'
+    zone_count: '{{ message_payload | int(-1) if source == ''occupancy'' else -1 }}'
+- variables:
+    zones_ok: '{{ required_zones | select(''in'',event_zones) | list | length > 0 }}'
+    objects_ok: '{{ required_labels | select(''in'',event_objects | map(''regex_replace'',''-verified$'','''') | list) | list
+      | length > 0 }}'
+    severity_ok: '{{ after.get(''severity'','''') in required_severities }}'
+    occupancy_usable: '{{ source == ''occupancy'' and zone_id in required_zones and zone_count | int >= 0 and is_number(message_payload)
+      and message_payload | float == zone_count | int }}'
+- variables:
+    qualifies: |-
+      {{ from_camera and event_type in ['new','update'] and after.get('id','') is string
+         and after.get('id','') | length > 0 and after.get('end_time') is none
+         and zones_ok and objects_ok and severity_ok }}
+    counts: |-
+      {% set ns=namespace(z={}) %} {% for zone in required_zones %}
+        {% set val=prior.get('z',{}).get(zone,-1) | int(-1) %}
+        {% if occupancy_usable and zone_id == zone %}{% set val=zone_count | int %}{% endif %}
+        {% set ns.z=dict(ns.z,**{zone:val}) %}
+      {% endfor %} {{ ns.z }}
+- variables:
+    zones_clear: '{{ counts | length > 0 and counts.values() | select(''equalto'',0) | list | length == counts | length }}'
+    missing_zones: '{{ counts.values() | select(''lt'',0) | list | length }}'
+    occupied_zones: '{{ counts.values() | select(''gt'',0) | list | length }}'
+    pulse_until: '{{ timestamp + 30 if qualifies else prior.get(''p'',0) | int(0) }}'
+- variables:
+    armed: '{% if qualifies %}{{ true }} {% else %}{{ prior.get(''a'',false) and (not zones_clear or pulse_until | int > timestamp
+      or previous_desired or prior.get(''l'',false)) }}{% endif %}'
+- variables:
+    raw_demand: '{{ motion_active or (armed and not zones_clear) }}'
+- variables:
+    off_at: '{% if raw_demand %}{{ 0 }} {% elif prior.get(''o'',0) | int > 0 %}{{ prior.get(''o'',0) | int }} {% elif prior.get(''h'',false)
+      %}{{ timestamp + delay_seconds | int }} {% else %}{{ 0 }}{% endif %}'
+    previous_lock: '{{ prior.get(''l'',false) }}'
+- variables:
+    remaining: '{{ [0, off_at | int - timestamp] | max }}'
+    demand_with_delay: '{{ raw_demand or off_at | int > timestamp }}'
+- variables:
+    run_start: |-
+      {% if config_valid and dark and demand_with_delay and not previous_lock %}
+        {{ prior.get('s',0) | int if prior.get('s',0) | int > 0 else timestamp }}
+      {% else %}{{ prior.get('s',0) | int if previous_lock else 0 }}{% endif %}
+- variables:
+    limit_reached: '{{ run_start | int > 0 and timestamp - run_start | int >= maximum_minutes | float * 60 }}'
+- variables:
+    locked: '{{ (previous_lock or limit_reached) and raw_demand }}'
+    limit_block: '{{ previous_lock or limit_reached }}'
+    next_state: '{{ {''v'':2,''m'':''presence'',''c'':camera_id,''z'':counts,''p'':pulse_until | int, ''a'':armed,''h'':raw_demand,''o'':off_at
+      | int,''s'':run_start | int if demand_with_delay else 0,''l'':locked} }}'
+- variables:
+    wanted: '{{ config_valid and dark and demand_with_delay and not limit_block }}'
+    decision: |-
+      {% if not config_valid %}ERROR: Check camera and filters
+      {% elif limit_block %}MAX reached: OFF until request clears
+      {% elif not solar_valid %}ERROR: Sun elevation unavailable
+      {% elif not dark %}Daylight: light blocked
+      {% elif motion_active %}Motion sensor active
+      {% elif armed and occupied_zones | int > 0 %}Person occupancy active
+      {% elif armed and missing_zones | int > 0 %}Waiting for {{ missing_zones }} zone counts
+      {% elif remaining | int > 0 %}Cooldown {{ remaining }}s
+      {% else %}No light request{% endif %}
+    filter_result: |-
+      {% if source == 'occupancy' and occupancy_usable %}{{ zone_id }}: {{ zone_count }} people
+      {% elif source == 'occupancy' %}Unmatched or invalid count
+      {% elif source != 'review' %}{{ last_filter }}
+      {% elif not from_camera %}Other camera or invalid packet
+      {% elif event_type == 'end' %}Review ended
+      {% elif not severity_ok %}Severity not selected
+      {% elif not zones_ok %}No matching zone
+      {% elif not objects_ok %}No matching object type
+      {% elif qualifies %}Review accepted
+      {% else %}Review ignored{% endif %}
+- variables:
+    state_changed: '{{ wanted != previous_desired }}'
+    status_text: '{{ (''ON '' ~ (brightness_pct | int) ~ ''%'' if wanted else ''OFF'') ~ '' | '' ~ decision | trim ~ '' |
+      Sun '' ~ ((solar_raw | float | round(1) | string) if solar_valid else ''?'') ~ '' | Filter: '' ~ filter_result | trim
+      }}'
+    command_needed: '{{ state_changed or source in [''startup'',''reload'',''manual''] or (timestamp - last_light_command
+      | int >= 30 and states(lamp) in [''on'',''off''] and is_state(lamp,''on'') != wanted) }}'
+    report_needed: '{{ debug_enabled and (state_changed or locked != previous_lock or decision | trim != last_decision or
+      (source == ''review'' and from_camera) or (source == ''occupancy'' and occupancy_usable)) }}'
+- if:
+  - condition: template
+    value_template: '{{ report_needed }}'
+  then:
+  - action: logbook.log
+    continue_on_error: true
+    data:
+      name: Frigate Camera Light
+      entity_id: '{{ lamp }}'
+      message: '{{ status_text }} | Source={{ source }}'
+  - event: frigate_camera_light_status
+    event_data:
+      camera: '{{ camera_entity }}'
+      light: '{{ lamp }}'
+      requested_on: '{{ wanted }}'
+      brightness_pct: '{{ brightness_pct | int if wanted else 0 }}'
+      decision: '{{ decision | trim }}'
+      filter: '{{ filter_result | trim }}'
+      zone_counts: '{{ counts }}'
+      cooldown_remaining: '{{ remaining }}'
+      maximum_on_minutes: '{{ maximum_minutes }}'
+      locked_out: '{{ locked }}'
+      source: '{{ source }}'
+      review_id: '{{ after.get("id", "") }}'
+      review_type: '{{ event_type }}'
+      review_severity: '{{ after.get("severity", "") }}'
+      review_zones: '{{ event_zones }}'
+      required_zones: '{{ required_zones }}'
+      state_topic: '{{ cache_topic }}'
+- alias: Commit controller state before controlling the light
+  action: mqtt.publish
+  data:
+    topic: '{{ cache_topic }}'
+    qos: 1
+    retain: true
+    payload: |-
+      {{ {'schema':1,'owner':controller_key,'light':lamp,'saved_at':timestamp,
+          'state':dict(next_state,w=wanted),
+          'last_command':timestamp if command_needed else last_light_command,
+          'last_filter':filter_result | trim,'last_decision':decision | trim} | to_json }}
+- if:
+  - condition: template
+    value_template: '{{ command_needed }}'
+  then:
+  - variables:
+      last_light_command: '{{ timestamp }}'
+  - choose:
+    - conditions:
       - condition: template
-        value_template: '{{ report_needed }}'
-      then:
-      - action: logbook.log
+        value_template: '{{ wanted }}'
+      sequence:
+      - action: light.turn_on
         continue_on_error: true
-        data:
-          name: Frigate Camera Light
+        target:
           entity_id: '{{ lamp }}'
-          message: '{{ status_text }} | Source={{ source }}'
-      - event: frigate_camera_light_status
-        event_data:
-          camera: '{{ camera_entity }}'
-          light: '{{ lamp }}'
-          requested_on: '{{ wanted }}'
-          brightness_pct: '{{ brightness_pct | int if wanted else 0 }}'
-          decision: '{{ decision | trim }}'
-          filter: '{{ filter_result | trim }}'
-          zone_counts: '{{ counts }}'
-          cooldown_remaining: '{{ remaining }}'
-          maximum_on_minutes: '{{ maximum_minutes }}'
-          locked_out: '{{ locked }}'
-    - if:
-      - condition: template
-        value_template: '{{ command_needed }}'
-      then:
-      - variables:
-          last_light_command: '{{ timestamp }}'
-      - choose:
-        - conditions:
-          - condition: template
-            value_template: '{{ wanted }}'
-          sequence:
-          - action: light.turn_on
-            continue_on_error: true
-            target:
-              entity_id: '{{ lamp }}'
-            data:
-              brightness_pct: '{{ brightness_pct | int }}'
-        default:
-        - action: light.turn_off
-          continue_on_error: true
-          target:
-            entity_id: '{{ lamp }}'
-    - variables:
-        controller_state: '{{ dict(next_state, w=wanted) }}'
-        last_filter: '{{ filter_result | trim }}'
-        last_decision: '{{ decision | trim }}'
-    - wait_for_trigger:
-      - trigger: mqtt
-        topic: '{{ review_topic }}'
-        id: review
-      - trigger: mqtt
-        topic: '{{ occupancy_topic_prefix ~ ''/+/person'' }}'
-        id: occupancy
-      - trigger: state
-        entity_id: !input 'motion_sensors'
-        id: motion
-      - trigger: state
-        entity_id: !input 'sun_entity'
-        id: sun
-      timeout:
-        seconds: 5
-      continue_on_timeout: true
-    - variables:
-        message_source: '{{ wait.trigger.id if wait.completed and wait.trigger is not none else ''tick'' }}'
-        message_payload: '{{ wait.trigger.payload if wait.completed and wait.trigger is not none and wait.trigger.id in [''review'',''occupancy'']
-          else '''' }}'
-        message_topic: '{{ wait.trigger.topic if wait.completed and wait.trigger is not none and wait.trigger.id == ''occupancy''
-          else '''' }}'
+        data:
+          brightness_pct: '{{ brightness_pct | int }}'
+    default:
+    - action: light.turn_off
+      continue_on_error: true
+      target:
+        entity_id: '{{ lamp }}'
+max: 200
+conditions:
+- condition: template
+  value_template: |-
+    {% if trigger is not defined or trigger.id is not defined %}{{ true }}
+    {% elif trigger.id == 'review' %}
+      {% set p=trigger.payload | from_json({}) %}
+      {{ p is mapping and p.get('after',{}) is mapping
+         and p.get('after',{}).get('camera','') == state_attr(camera_entity,'camera_name') }}
+    {% elif trigger.id == 'occupancy' %}
+      {{ trigger.topic.startswith(zone_prefix ~ '/') and trigger.topic.endswith('/person')
+         and trigger.topic[(zone_prefix | length)+1:-7] in required_zones }}
+    {% else %}{{ true }}{% endif %}

@@ -27,7 +27,7 @@ Home Assistant blueprint to control camera lights using Frigate detections, zone
 
 The camera name is read from its `camera_name` attribute. The default review topic is `frigate/reviews`; person counts use `frigate/<zone_id>/person`.
 
-Disable competing device lighting rules. This automation exclusively controls the selected light and requests **OFF whenever its controller starts**, including after reloads. It does not change camera image settings or illumination modes.
+Disable competing device lighting rules. This automation exclusively controls the selected light. Its internal MQTT state is restored after reloads when available. If that state is unavailable while the light is on, it requests OFF instead of assuming a new lighting session. It does not change camera image settings or illumination modes.
 
 ## Behavior
 
