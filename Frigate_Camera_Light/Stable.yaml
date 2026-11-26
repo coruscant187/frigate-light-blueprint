@@ -109,7 +109,8 @@ blueprint:
       description: The topic used by Frigate to publish review messages.
     maximum_on:
       name: Maximum continuous on-time
-      description: Switch off and lock out further activation until the request clears. Also applies to continuous motion.
+      description: Switch off at this limit. Recover after requests clear, or after fresh eligible activity and at least five
+        seconds off.
       default: 5
       selector:
         number:
@@ -124,6 +125,12 @@ blueprint:
       default: frigate
       selector:
         text: {}
+    object_topic:
+      name: MQTT tracked-object topic
+      description: Used to recognize a new person entering a selected zone, including within the same review.
+      default: frigate/events
+      selector:
+        text: {}
 mode: queued
 max_exceeded: warning
 trace:
@@ -131,10 +138,14 @@ trace:
 trigger_variables:
   review_topic: !input 'mqtt_topic'
   occupancy_topic_prefix: !input 'occupancy_prefix'
+  tracked_object_topic: !input 'object_topic'
 triggers:
 - trigger: mqtt
   topic: '{{ review_topic }}'
   id: review
+- trigger: mqtt
+  topic: '{{ tracked_object_topic }}'
+  id: object
 - trigger: mqtt
   topic: '{{ occupancy_topic_prefix ~ ''/+/person'' }}'
   id: occupancy
@@ -174,7 +185,7 @@ actions:
 - variables:
     controller_key: '{{ ''automation_'' ~ (this.attributes.get(''id'',this.entity_id) | string) }}'
     message_source: '{{ trigger.id if trigger is defined and trigger.id is defined else ''manual'' }}'
-    message_payload: '{{ trigger.payload if trigger is defined and trigger.id is defined and trigger.id in [''review'',''occupancy'']
+    message_payload: '{{ trigger.payload if trigger is defined and trigger.id is defined and trigger.id in [''review'',''occupancy'',''object'']
       else '''' }}'
     message_topic: '{{ trigger.topic if trigger is defined and trigger.id is defined and trigger.id == ''occupancy'' else
       '''' }}'
@@ -222,7 +233,8 @@ actions:
     source: '{{ message_source }}'
     timestamp: '{{ as_timestamp(now()) | int }}'
     camera_id: '{{ state_attr(camera_entity,''camera_name'') | default('''',true) }}'
-    packet: '{{ (message_payload if message_payload is mapping else message_payload | from_json({})) if source == ''review'' else {} }}'
+    packet: '{{ (message_payload if message_payload is mapping else message_payload | from_json({})) if source in [''review'',''object'']
+      else {} }}'
     cached: '{{ stored.get(''state'',{}) if cache_valid and stored.get(''light'') == lamp else {} }}'
     previous_desired: '{{ cached.get(''w'',false) if cached is mapping else false }}'
     solar_raw: '{{ state_attr(solar_entity,''elevation'') if state_attr(solar_entity,''elevation'') is not none else states(solar_entity)
@@ -231,15 +243,17 @@ actions:
     after: '{{ packet.get(''after'',{}) if packet is mapping and packet.get(''after'',{}) is mapping else {} }}'
     cache: '{{ cached if cached is mapping else {} }}'
     solar_valid: '{{ states(solar_entity) not in [''unknown'',''unavailable''] and is_number(solar_raw) }}'
+    before: '{{ packet.get(''before'',{}) if packet is mapping and packet.get(''before'',{}) is mapping else {} }}'
 - variables:
     config_valid: '{{ camera_id | length > 0 and required_zones | length > 0 and required_severities | length > 0 }}'
     event_type: '{{ packet.get(''type'','''') if packet is mapping else '''' }}'
     event_data: '{{ after.get(''data'',{}) if after.get(''data'',{}) is mapping else {} }}'
-    from_camera: '{{ source == ''review'' and after.get(''camera'','''') == camera_id and camera_id | length > 0 }}'
+    from_camera: '{{ source in [''review'',''object''] and after.get(''camera'','''') == camera_id and camera_id | length
+      > 0 }}'
     motion_active: '{{ motion_entities | select(''is_state'',''on'') | list | length > 0 }}'
     dark: '{{ solar_valid and solar_raw | float(90) <= solar_limit | float }}'
-    config_matches: '{{ cache.get(''v'') == 3 and cache.get(''m'') == ''presence'' and cache.get(''c'') == camera_id and cache.get(''z'',{})
-      is mapping and cache.get(''z'',{}) | list | sort == required_zones | sort }}'
+    config_matches: '{{ cache.get(''v'') in [3,4] and cache.get(''m'') == ''presence'' and cache.get(''c'') == camera_id and
+      cache.get(''z'',{}) is mapping and cache.get(''z'',{}) | list | sort == required_zones | sort }}'
 - variables:
     prior: '{{ cache if config_matches else {} }}'
     event_zones: '{{ event_data.get(''zones'',[]) if event_data.get(''zones'',[]) is list else [] }}'
@@ -248,7 +262,6 @@ actions:
       ~ ''/'') and message_topic.endswith(''/person'') else '''' }}'
     zone_count: '{{ message_payload | int(-1) if source == ''occupancy'' else -1 }}'
 - variables:
-    zones_ok: '{{ required_zones | select(''in'',event_zones) | list | length > 0 }}'
     objects_ok: '{{ required_labels | select(''in'',event_objects | map(''regex_replace'',''-verified$'','''') | list) | list
       | length > 0 }}'
     severity_ok: '{{ after.get(''severity'','''') in required_severities }}'
@@ -262,8 +275,37 @@ actions:
         {% set ns.z=dict(ns.z,**{zone:val}) %}
       {% endfor %} {{ ns.z }}
     review_id: '{{ after.get(''id'','''') if after.get(''id'','''') is string else '''' }}'
-    review_message_valid: '{{ from_camera and event_type in [''new'',''update'',''end''] and after.get(''id'','''') is string
-      and after.get(''id'','''') | length > 0 }}'
+    review_message_valid: '{{ source == ''review'' and from_camera and event_type in [''new'',''update'',''end''] and after.get(''id'','''')
+      is string and after.get(''id'','''') | length > 0 }}'
+- variables:
+    person_id: '{{ after.get(''id'','''') if after.get(''id'','''') is string else '''' }}'
+    person_message_valid: |-
+      {{ source == 'object' and from_camera and event_type in ['new','update','end']
+         and after.get('label') == 'person' and after.get('false_positive') == false
+         and after.get('id','') is string and after.get('id','') | length > 0 }}
+    current_person_zones: '{{ after.get(''current_zones'',[]) if after.get(''current_zones'',[]) is list else [] }}'
+    before_person_zones: '{{ before.get(''current_zones'',[]) if before.get(''current_zones'',[]) is list else [] }}'
+    known_people: '{{ prior.get(''people'',{}) if prior.get(''people'',{}) is mapping else {} }}'
+- variables:
+    person_in_zone: '{{ required_zones | select(''in'',current_person_zones) | list | length > 0 }}'
+    person_was_in_zone: '{{ required_zones | select(''in'',before_person_zones) | list | length > 0 }}'
+    known_person: '{{ known_people.get(person_id,{}) if known_people.get(person_id,{}) is mapping else {} }}'
+- variables:
+    person_entry: |-
+      {{ person_message_valid and event_type in ['new','update'] and after.get('end_time') is none
+         and person_in_zone and not known_person.get('entered',false) and not known_person.get('ended',false)
+         and (event_type == 'new' or (before.get('current_zones') is list and not person_was_in_zone)) }}
+    person_registry: |-
+      {% set ns=namespace(people={}) %} {% set lifetime=[3600,maximum_minutes | int * 60 + delay_seconds | int] | max %} {% for pid,item in known_people.items() %}
+        {% if item is mapping and timestamp - item.get('seen',0) | int < lifetime %}
+          {% set ns.people=dict(ns.people,**{pid:item}) %}
+        {% endif %}
+      {% endfor %} {% if person_message_valid %}
+        {% set entry={'seen':timestamp,'entered':known_person.get('entered',false) or person_in_zone or person_was_in_zone,
+          'in_zone':person_in_zone,
+          'ended':known_person.get('ended',false) or event_type == 'end' or after.get('end_time') is not none} %}
+        {% set ns.people=dict(ns.people,**{person_id:entry}) %}
+      {% endif %} {{ ns.people }}
 - variables:
     zones_clear: '{{ counts | length > 0 and counts.values() | select(''equalto'',0) | list | length == counts | length }}'
     missing_zones: '{{ counts.values() | select(''lt'',0) | list | length }}'
@@ -293,37 +335,66 @@ actions:
 - variables:
     active_review_count: '{{ review_registry[''active''] | length }}'
 - variables:
+    fresh_review: |-
+      {{ review_message_valid and review_id in review_registry['active']
+         and review_id not in prior.get('r',{}) }}
+    old_ticket: '{{ prior.get(''ticket'',{}) if prior.get(''ticket'',{}) is mapping else {} }}'
+- variables:
+    recovery_ticket: |-
+      {% if prior.get('l',false) and fresh_review %}
+        {{ {'kind':'review','id':review_id,'until':timestamp+30} }}
+      {% elif prior.get('l',false) and person_entry %}
+        {{ {'kind':'person','id':person_id,'until':timestamp+30} }}
+      {% elif prior.get('l',false) and old_ticket.get('until',0) | int >= timestamp %}
+        {{ old_ticket }}
+      {% else %}{{ {} }}{% endif %}
+- variables:
+    ticket_valid: |-
+      {% if recovery_ticket.get('kind') == 'review' %}
+        {{ recovery_ticket.get('id') in review_registry['active'] }}
+      {% elif recovery_ticket.get('kind') == 'person' %}
+        {% set item=person_registry.get(recovery_ticket.get('id'),{}) %}
+        {{ item is mapping and item.get('in_zone',false) and not item.get('ended',true) }}
+      {% else %}{{ false }}{% endif %}
+- variables:
+    recovery: |-
+      {{ prior.get('l',false) and ticket_valid and active_review_count | int > 0
+         and occupied_zones | int > 0 and dark and config_valid
+         and timestamp - prior.get('lock_at',timestamp) | int >= 5 }}
+- variables:
     armed: '{{ (active_review_count | int > 0 and occupied_zones | int > 0 and dark) or (prior.get(''a'',false) and dark and
       (not zones_clear or previous_desired or prior.get(''l'',false))) }}'
 - variables:
     raw_demand: '{{ motion_active or (armed and not zones_clear) }}'
 - variables:
-    off_at: '{% if raw_demand %}{{ 0 }} {% elif prior.get(''o'',0) | int > 0 %}{{ prior.get(''o'',0) | int }} {% elif prior.get(''h'',false)
-      %}{{ timestamp + delay_seconds | int }} {% else %}{{ 0 }}{% endif %}'
-    previous_lock: '{{ prior.get(''l'',false) }}'
+    off_at: '{% if raw_demand or prior.get(''l'',false) %}{{ 0 }} {% elif prior.get(''o'',0) | int > 0 %}{{ prior.get(''o'',0)
+      | int }} {% elif prior.get(''h'',false) %}{{ timestamp + delay_seconds | int }} {% else %}{{ 0 }}{% endif %}'
+    previous_lock: '{{ prior.get(''l'',false) and not recovery }}'
 - variables:
     remaining: '{{ [0, off_at | int - timestamp] | max }}'
     demand_with_delay: '{{ raw_demand or off_at | int > timestamp }}'
 - variables:
     run_start: |-
       {% if config_valid and dark and demand_with_delay and not previous_lock %}
-        {{ prior.get('s',0) | int if prior.get('s',0) | int > 0 else timestamp }}
+        {{ timestamp if recovery else (prior.get('s',0) | int if prior.get('s',0) | int > 0 else timestamp) }}
       {% else %}{{ prior.get('s',0) | int if previous_lock else 0 }}{% endif %}
 - variables:
     limit_reached: '{{ run_start | int > 0 and timestamp - run_start | int >= maximum_minutes | float * 60 }}'
 - variables:
     locked: '{{ (previous_lock or limit_reached) and raw_demand }}'
     limit_block: '{{ previous_lock or limit_reached }}'
-    next_state: '{{ {''v'':3,''m'':''presence'',''c'':camera_id,''z'':counts,''r'':review_registry[''active''],''e'':review_registry[''ended''],''a'':armed
-      and dark and (raw_demand or remaining | int > 0),''h'':raw_demand,''o'':off_at | int,''s'':run_start | int if demand_with_delay
-      else 0,''l'':locked} }}'
+    next_state: '{{ {''v'':4,''m'':''presence'',''c'':camera_id,''z'':counts,''r'':review_registry[''active''],''e'':review_registry[''ended''],''people'':person_registry,''ticket'':recovery_ticket
+      if locked else {},''lock_at'':(prior.get(''lock_at'',timestamp) if prior.get(''l'',false) else timestamp) if locked
+      else 0,''a'':armed and dark and (raw_demand or remaining | int > 0),''h'':raw_demand,''o'':off_at | int,''s'':run_start
+      | int if demand_with_delay else 0,''l'':locked} }}'
 - variables:
     wanted: '{{ config_valid and dark and demand_with_delay and not limit_block }}'
     decision: |-
       {% if not config_valid %}ERROR: Check camera and filters
-      {% elif limit_block %}MAX reached: OFF until request clears
+      {% elif limit_block %}MAX reached: waiting for clear or fresh activity
       {% elif not solar_valid %}ERROR: Sun elevation unavailable
       {% elif not dark %}Daylight: light blocked
+      {% elif recovery %}Fresh activity: new lighting session
       {% elif motion_active %}Motion sensor active
       {% elif armed and occupied_zones | int > 0 %}Person occupancy active
       {% elif armed and missing_zones | int > 0 %}Waiting for {{ missing_zones }} zone counts
@@ -334,6 +405,8 @@ actions:
     filter_result: |-
       {% if source == 'occupancy' and occupancy_usable %}{{ zone_id }}: {{ zone_count }} people
       {% elif source == 'occupancy' %}Unmatched or invalid count
+      {% elif source == 'object' and person_entry %}New tracked person entered a selected zone
+      {% elif source == 'object' %}Tracked person update; no new zone entry
       {% elif source != 'review' %}{{ last_filter }}
       {% elif not from_camera %}Other camera or invalid packet
       {% elif review_message_valid and (event_type == 'end' or after.get('end_time') is not none) %}Review ended; authorization removed
@@ -349,8 +422,9 @@ actions:
       }}'
     command_needed: '{{ state_changed or source in [''startup'',''reload'',''manual''] or (timestamp - last_light_command
       | int >= 30 and states(lamp) in [''on'',''off''] and is_state(lamp,''on'') != wanted) }}'
-    report_needed: '{{ debug_enabled and (state_changed or locked != previous_lock or decision | trim != last_decision or
-      (source == ''review'' and from_camera) or (source == ''occupancy'' and occupancy_usable)) }}'
+    report_needed: '{{ debug_enabled and (state_changed or recovery or person_entry or locked != previous_lock or decision
+      | trim != last_decision or (source == ''review'' and from_camera) or (source == ''occupancy'' and occupancy_usable))
+      }}'
 - if:
   - condition: template
     value_template: '{{ report_needed }}'
@@ -374,7 +448,7 @@ actions:
       maximum_on_minutes: '{{ maximum_minutes }}'
       locked_out: '{{ locked }}'
       source: '{{ source }}'
-      review_id: '{{ after.get("id", "") }}'
+      review_id: '{{ review_id if source == ''review'' else '''' }}'
       review_type: '{{ event_type }}'
       review_severity: '{{ after.get("severity", "") }}'
       review_zones: '{{ event_zones }}'
@@ -383,6 +457,11 @@ actions:
       eligible_review_count: '{{ active_review_count }}'
       review_authorized: '{{ active_review_count | int > 0 }}'
       zone_occupied: '{{ occupied_zones | int > 0 }}'
+      person_id: '{{ person_id if source == ''object'' else '''' }}'
+      person_entry: '{{ person_entry }}'
+      recovered_from_lockout: '{{ recovery }}'
+      recovery_pending: '{{ recovery_ticket | length > 0 and locked }}'
+      recovery_reason: '{{ recovery_ticket.get(''kind'','''') }}'
 - alias: Commit controller state before controlling the light
   action: mqtt.publish
   data:
@@ -421,7 +500,7 @@ conditions:
 - condition: template
   value_template: |-
     {% if trigger is not defined or trigger.id is not defined %}{{ true }}
-    {% elif trigger.id == 'review' %}
+    {% elif trigger.id in ['review','object'] %}
       {% set p=trigger.payload | from_json({}) %}
       {{ p is mapping and p.get('after',{}) is mapping
          and p.get('after',{}).get('camera','') == state_attr(camera_entity,'camera_name') }}
