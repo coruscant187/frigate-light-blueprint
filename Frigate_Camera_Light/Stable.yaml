@@ -127,7 +127,7 @@ blueprint:
 mode: queued
 max_exceeded: warning
 trace:
-  stored_traces: 20
+  stored_traces: 100
 trigger_variables:
   review_topic: !input 'mqtt_topic'
   occupancy_topic_prefix: !input 'occupancy_prefix'
@@ -222,7 +222,7 @@ actions:
     source: '{{ message_source }}'
     timestamp: '{{ as_timestamp(now()) | int }}'
     camera_id: '{{ state_attr(camera_entity,''camera_name'') | default('''',true) }}'
-    packet: '{{ message_payload | from_json({}) if source == ''review'' else {} }}'
+    packet: '{{ (message_payload if message_payload is mapping else message_payload | from_json({})) if source == ''review'' else {} }}'
     cached: '{{ stored.get(''state'',{}) if cache_valid and stored.get(''light'') == lamp else {} }}'
     previous_desired: '{{ cached.get(''w'',false) if cached is mapping else false }}'
     solar_raw: '{{ state_attr(solar_entity,''elevation'') if state_attr(solar_entity,''elevation'') is not none else states(solar_entity)
@@ -238,7 +238,7 @@ actions:
     from_camera: '{{ source == ''review'' and after.get(''camera'','''') == camera_id and camera_id | length > 0 }}'
     motion_active: '{{ motion_entities | select(''is_state'',''on'') | list | length > 0 }}'
     dark: '{{ solar_valid and solar_raw | float(90) <= solar_limit | float }}'
-    config_matches: '{{ cache.get(''v'') == 2 and cache.get(''m'') == ''presence'' and cache.get(''c'') == camera_id and cache.get(''z'',{})
+    config_matches: '{{ cache.get(''v'') == 3 and cache.get(''m'') == ''presence'' and cache.get(''c'') == camera_id and cache.get(''z'',{})
       is mapping and cache.get(''z'',{}) | list | sort == required_zones | sort }}'
 - variables:
     prior: '{{ cache if config_matches else {} }}'
@@ -255,24 +255,46 @@ actions:
     occupancy_usable: '{{ source == ''occupancy'' and zone_id in required_zones and zone_count | int >= 0 and is_number(message_payload)
       and message_payload | float == zone_count | int }}'
 - variables:
-    qualifies: |-
-      {{ from_camera and event_type in ['new','update'] and after.get('id','') is string
-         and after.get('id','') | length > 0 and after.get('end_time') is none
-         and zones_ok and objects_ok and severity_ok }}
     counts: |-
       {% set ns=namespace(z={}) %} {% for zone in required_zones %}
         {% set val=prior.get('z',{}).get(zone,-1) | int(-1) %}
         {% if occupancy_usable and zone_id == zone %}{% set val=zone_count | int %}{% endif %}
         {% set ns.z=dict(ns.z,**{zone:val}) %}
       {% endfor %} {{ ns.z }}
+    review_id: '{{ after.get(''id'','''') if after.get(''id'','''') is string else '''' }}'
+    review_message_valid: '{{ from_camera and event_type in [''new'',''update'',''end''] and after.get(''id'','''') is string
+      and after.get(''id'','''') | length > 0 }}'
 - variables:
     zones_clear: '{{ counts | length > 0 and counts.values() | select(''equalto'',0) | list | length == counts | length }}'
     missing_zones: '{{ counts.values() | select(''lt'',0) | list | length }}'
     occupied_zones: '{{ counts.values() | select(''gt'',0) | list | length }}'
-    pulse_until: '{{ timestamp + 30 if qualifies else prior.get(''p'',0) | int(0) }}'
 - variables:
-    armed: '{% if qualifies %}{{ true }} {% else %}{{ prior.get(''a'',false) and (not zones_clear or pulse_until | int > timestamp
-      or previous_desired or prior.get(''l'',false)) }}{% endif %}'
+    review_registry: |-
+      {% set ns=namespace(active={},ended={}) %} {% set old_active=prior.get('r',{}) if prior.get('r',{}) is mapping else {} %} {% set old_ended=prior.get('e',{}) if prior.get('e',{}) is mapping else {} %} {% set lifetime=[3600, maximum_minutes | int * 60 + delay_seconds | int] | max %} {% for rid,seen in old_active.items() %}
+        {% if is_number(seen) and timestamp - seen | int < lifetime and seen | int <= timestamp %}
+          {% set ns.active=dict(ns.active,**{rid:seen | int}) %}
+        {% endif %}
+      {% endfor %} {% for rid,seen in old_ended.items() %}
+        {% if is_number(seen) and timestamp - seen | int < lifetime and seen | int <= timestamp %}
+          {% set ns.ended=dict(ns.ended,**{rid:seen | int}) %}
+        {% endif %}
+      {% endfor %} {% if review_message_valid %}
+        {% if event_type == 'end' or after.get('end_time') is not none %}
+          {% set clean=namespace(active={}) %}
+          {% for rid,seen in ns.active.items() if rid != review_id %}
+            {% set clean.active=dict(clean.active,**{rid:seen}) %}
+          {% endfor %}
+          {% set ns.active=clean.active %}
+          {% set ns.ended=dict(ns.ended,**{review_id:timestamp}) %}
+        {% elif review_id not in ns.ended and (review_id in ns.active or (objects_ok and severity_ok)) %}
+          {% set ns.active=dict(ns.active,**{review_id:timestamp}) %}
+        {% endif %}
+      {% endif %} {{ {'active':ns.active,'ended':ns.ended} }}
+- variables:
+    active_review_count: '{{ review_registry[''active''] | length }}'
+- variables:
+    armed: '{{ (active_review_count | int > 0 and occupied_zones | int > 0 and dark) or (prior.get(''a'',false) and dark and
+      (not zones_clear or previous_desired or prior.get(''l'',false))) }}'
 - variables:
     raw_demand: '{{ motion_active or (armed and not zones_clear) }}'
 - variables:
@@ -292,8 +314,9 @@ actions:
 - variables:
     locked: '{{ (previous_lock or limit_reached) and raw_demand }}'
     limit_block: '{{ previous_lock or limit_reached }}'
-    next_state: '{{ {''v'':2,''m'':''presence'',''c'':camera_id,''z'':counts,''p'':pulse_until | int, ''a'':armed,''h'':raw_demand,''o'':off_at
-      | int,''s'':run_start | int if demand_with_delay else 0,''l'':locked} }}'
+    next_state: '{{ {''v'':3,''m'':''presence'',''c'':camera_id,''z'':counts,''r'':review_registry[''active''],''e'':review_registry[''ended''],''a'':armed
+      and dark and (raw_demand or remaining | int > 0),''h'':raw_demand,''o'':off_at | int,''s'':run_start | int if demand_with_delay
+      else 0,''l'':locked} }}'
 - variables:
     wanted: '{{ config_valid and dark and demand_with_delay and not limit_block }}'
     decision: |-
@@ -305,17 +328,19 @@ actions:
       {% elif armed and occupied_zones | int > 0 %}Person occupancy active
       {% elif armed and missing_zones | int > 0 %}Waiting for {{ missing_zones }} zone counts
       {% elif remaining | int > 0 %}Cooldown {{ remaining }}s
+      {% elif active_review_count | int > 0 %}Review authorized; waiting for zone occupancy
+      {% elif occupied_zones | int > 0 %}Zone occupied; waiting for an eligible person review
       {% else %}No light request{% endif %}
     filter_result: |-
       {% if source == 'occupancy' and occupancy_usable %}{{ zone_id }}: {{ zone_count }} people
       {% elif source == 'occupancy' %}Unmatched or invalid count
       {% elif source != 'review' %}{{ last_filter }}
       {% elif not from_camera %}Other camera or invalid packet
-      {% elif event_type == 'end' %}Review ended
+      {% elif review_message_valid and (event_type == 'end' or after.get('end_time') is not none) %}Review ended; authorization removed
+      {% elif review_id in review_registry['ended'] %}Completed review ignored
+      {% elif review_id in review_registry['active'] %}Review accepted
       {% elif not severity_ok %}Severity not selected
-      {% elif not zones_ok %}No matching zone
       {% elif not objects_ok %}No matching object type
-      {% elif qualifies %}Review accepted
       {% else %}Review ignored{% endif %}
 - variables:
     state_changed: '{{ wanted != previous_desired }}'
@@ -355,6 +380,9 @@ actions:
       review_zones: '{{ event_zones }}'
       required_zones: '{{ required_zones }}'
       state_topic: '{{ cache_topic }}'
+      eligible_review_count: '{{ active_review_count }}'
+      review_authorized: '{{ active_review_count | int > 0 }}'
+      zone_occupied: '{{ occupied_zones | int > 0 }}'
 - alias: Commit controller state before controlling the light
   action: mqtt.publish
   data:
